@@ -693,6 +693,71 @@ impl WindowsInterface {
         self.post_submit(r, t)
     }
 
+    /// Timed variant of `submit`. Reuses the same threadpool `Timer` +
+    /// `timeout_mutex` mechanism that `submit_control` already uses for
+    /// control transfer timeouts.
+    ///
+    /// On timeout, `CancelIoEx` is issued, but `take_completion` still
+    /// retrieves the correct `actual_len` via `GetOverlappedResult`, so no
+    /// data is lost (unlike macOS's `AbortPipe`).
+    fn submit_with_timeout(&self, mut t: Idle<TransferData>, timeout: Duration) -> Pending<TransferData> {
+        let endpoint = t.endpoint;
+        let dir = Direction::from_address(endpoint);
+        let len = t.request_len;
+        let buf = t.buf;
+        t.overlapped = unsafe { mem::zeroed() };
+        t.error_from_submit = Ok(());
+
+        // As in `submit_control`, hold the lock so the timer callback can't
+        // try to cancel the transfer before we've submitted it.
+        let lock = self.timeout_mutex.lock().unwrap();
+
+        let ptr = t.as_ptr();
+
+        // Safety: same reasoning as in `submit_control`.
+        let timer = unsafe {
+            Timer::new(timer_callback, ptr as *mut c_void)
+                .expect("failed to create timer for bulk/interrupt transfer")
+        };
+        t.timeout = Some(timer);
+
+        let t = t.pre_submit();
+
+        unsafe {
+            (*ptr).timeout.as_ref().unwrap().set(timeout);
+        }
+
+        debug!("Submit {dir:?} transfer {ptr:?} on endpoint {endpoint:02X} for {len} bytes with timeout {timeout:?}");
+
+        unsafe {
+            StartThreadpoolIo(self.threadpool_io);
+        }
+
+        let r = unsafe {
+            match dir {
+                Direction::Out => WinUsb_WritePipe(
+                    self.winusb_handle,
+                    endpoint,
+                    buf,
+                    len,
+                    null_mut(),
+                    ptr as *mut OVERLAPPED,
+                ),
+                Direction::In => WinUsb_ReadPipe(
+                    self.winusb_handle,
+                    endpoint,
+                    buf,
+                    len,
+                    null_mut(),
+                    ptr as *mut OVERLAPPED,
+                ),
+            }
+        };
+
+        drop(lock);
+        self.post_submit(r, t)
+    }
+
     fn submit_control(
         &self,
         mut t: Idle<TransferData>,
@@ -857,6 +922,12 @@ impl WindowsEndpoint {
     pub(crate) fn submit(&mut self, buffer: Buffer) {
         let t = self.make_transfer(buffer);
         let t = self.inner.interface.submit(t);
+        self.pending.push_back(t);
+    }
+
+    pub(crate) fn submit_with_timeout(&mut self, buffer: Buffer, timeout: Duration) {
+        let t = self.make_transfer(buffer);
+        let t = self.inner.interface.submit_with_timeout(t, timeout);
         self.pending.push_back(t);
     }
 

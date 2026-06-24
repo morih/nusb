@@ -790,6 +790,19 @@ impl LinuxEndpoint {
             .push_back(self.inner.interface.device.submit(transfer));
     }
 
+    /// Timed variant of `submit`. Reuses `LinuxDevice::submit_timeout`,
+    /// which is already used internally for control transfer timeouts:
+    /// it registers a deadline for the URB, and a background thread issues
+    /// `USBDEVFS_DISCARDURB` once it elapses. usbfs reports `actual_length`
+    /// correctly for a discarded URB, so no data is lost on timeout (unlike
+    /// macOS's `AbortPipe`).
+    pub(crate) fn submit_with_timeout(&mut self, data: Buffer, timeout: Duration) {
+        let mut transfer = self.get_transfer();
+        transfer.set_buffer(data);
+        self.pending
+            .push_back(self.inner.interface.device.submit_timeout(transfer, timeout));
+    }
+
     pub(crate) fn submit_err(&mut self, data: Buffer, error: TransferError) {
         assert_eq!(error, TransferError::InvalidArgument);
         let mut transfer = self.get_transfer();

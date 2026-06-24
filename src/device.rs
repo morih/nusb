@@ -763,30 +763,28 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
         self.backend.submit(buf)
     }
 
-    /// Like [`submit`][`Self::submit`], but lets the OS driver enforce a
-    /// per-transfer timeout natively.
+    /// Like [`submit`][`Self::submit`], but bounds how long the transfer may
+    /// remain pending before it is cancelled.
     ///
-    /// `no_data_timeout` bounds how long the transfer may wait without any
-    /// data being transferred at all; `completion_timeout` bounds the total
-    /// time allowed for the transfer to complete. Either timeout firing ends
-    /// the transfer with [`TransferError::Cancelled`][crate::transfer::TransferError::Cancelled],
-    /// but — unlike cancelling via [`Endpoint::cancel_all`] — the resulting
-    /// [`Completion::actual_len`][crate::transfer::Completion::actual_len] correctly
-    /// reflects however many bytes were transferred before the timeout, since
-    /// the timeout is handled by the USB driver itself rather than by an
-    /// asynchronous software-side abort.
+    /// If `timeout` elapses before the transfer completes, it ends with
+    /// [`TransferError::Cancelled`][crate::transfer::TransferError::Cancelled] —
+    /// but unlike calling [`Endpoint::cancel_all`] yourself after a software
+    /// timer, the resulting
+    /// [`Completion::actual_len`][crate::transfer::Completion::actual_len]
+    /// correctly reflects however many bytes were transferred before the
+    /// timeout fired, on every supported platform:
     ///
-    /// **macOS only.** This uses IOKit's `ReadPipeAsyncTO`/`WritePipeAsyncTO`,
-    /// which is not available through the cross-platform `submit` API. On
-    /// other platforms, software-side cancellation (`cancel_all`) does not
-    /// reliably preserve `actual_len`, so there is no equivalent yet.
-    #[cfg(target_os = "macos")]
-    pub fn submit_with_timeout(
-        &mut self,
-        buf: Buffer,
-        no_data_timeout: std::time::Duration,
-        completion_timeout: std::time::Duration,
-    ) {
+    /// * **macOS**: uses IOKit's `ReadPipeAsyncTO`/`WritePipeAsyncTO`, which
+    ///   let the driver itself enforce the timeout (the `no_data_timeout` and
+    ///   `completion_timeout` IOKit parameters are both set to `timeout`).
+    /// * **Linux**: reuses the same per-transfer deadline/cancellation
+    ///   mechanism already used internally for control transfer timeouts;
+    ///   `usbfs` correctly reports `actual_length` for a discarded URB.
+    /// * **Windows**: reuses the same threadpool `Timer` + `CancelIoEx`
+    ///   mechanism already used internally for control transfer timeouts;
+    ///   `GetOverlappedResult` correctly reports the bytes transferred even
+    ///   after cancellation.
+    pub fn submit_with_timeout(&mut self, buf: Buffer, timeout: std::time::Duration) {
         if Dir::DIR == Direction::In {
             let req_len = buf.requested_len();
             if req_len == 0 || req_len % self.max_packet_size() != 0 {
@@ -800,11 +798,15 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
             }
         }
 
-        self.backend.submit_with_timeout(
-            buf,
-            no_data_timeout.as_millis().min(u32::MAX as u128) as u32,
-            completion_timeout.as_millis().min(u32::MAX as u128) as u32,
-        )
+        #[cfg(target_os = "macos")]
+        {
+            let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            self.backend.submit_with_timeout(buf, timeout_ms, timeout_ms)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.backend.submit_with_timeout(buf, timeout)
+        }
     }
 
     /// Return a `Future` that waits for the next pending transfer to complete.
