@@ -598,6 +598,78 @@ impl MacEndpoint {
         self.pending.push_back(transfer);
     }
 
+    /// Timeout-enabled variant of `submit`. Uses IOKit's `ReadPipeAsyncTO`/
+    /// `WritePipeAsyncTO` to let the driver itself manage the transfer
+    /// timeout.
+    ///
+    /// The difference from `submit` combined with cancellation via the
+    /// software-side `AbortPipe` is that, when a timeout occurs, `actual_len`
+    /// correctly reflects the number of bytes actually transferred so far
+    /// (whereas cancellation via `AbortPipe` always causes macOS's IOKit USB
+    /// driver to return `actual_len = 0`, losing the partial data).
+    /// `no_data_timeout`/`completion_timeout` correspond respectively to the
+    /// IOKit parameters of the same name (see Apple's IOUSBLib documentation,
+    /// or `IOUSBDevRequestTO` in `control_blocking`, for details).
+    ///
+    pub(crate) fn submit_with_timeout(
+        &mut self,
+        buffer: Buffer,
+        no_data_timeout_ms: u32,
+        completion_timeout_ms: u32,
+    ) {
+        let transfer = self.make_transfer(buffer);
+        let endpoint = self.inner.address;
+        let dir = Direction::from_address(endpoint);
+        let req_len = transfer.requested_len;
+        let buf_ptr = transfer.buf;
+
+        let transfer = transfer.pre_submit();
+        let ptr = transfer.as_ptr();
+
+        let res = unsafe {
+            match dir {
+                Direction::Out => call_iokit_function!(
+                    self.inner.interface.interface.raw,
+                    WritePipeAsyncTO(
+                        self.inner.pipe_ref,
+                        buf_ptr as *mut c_void,
+                        req_len,
+                        no_data_timeout_ms,
+                        completion_timeout_ms,
+                        Some(transfer_callback),
+                        ptr as *mut c_void
+                    )
+                ),
+                Direction::In => call_iokit_function!(
+                    self.inner.interface.interface.raw,
+                    ReadPipeAsyncTO(
+                        self.inner.pipe_ref,
+                        buf_ptr as *mut c_void,
+                        req_len,
+                        no_data_timeout_ms,
+                        completion_timeout_ms,
+                        Some(transfer_callback),
+                        ptr as *mut c_void
+                    )
+                ),
+            }
+        };
+
+        if res == kIOReturnSuccess {
+            debug!(
+                "Submitted {dir:?} transfer {ptr:?} of len {req_len} on endpoint {endpoint:02X} (TO)"
+            );
+        } else {
+            error!("Failed to submit {dir:?} transfer {ptr:?} of len {req_len} on endpoint {endpoint:02X} (TO): {res:x}");
+            unsafe {
+                (*ptr).status = res;
+                notify_completion::<super::TransferData>(ptr);
+            }
+        }
+
+        self.pending.push_back(transfer);
+    }
+
     pub(crate) fn submit_err(&mut self, buffer: Buffer, err: TransferError) {
         assert_eq!(err, TransferError::InvalidArgument);
         let mut transfer = self.make_transfer(buffer);

@@ -763,6 +763,50 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> Endpoint<EpType, Dir> {
         self.backend.submit(buf)
     }
 
+    /// Like [`submit`][`Self::submit`], but lets the OS driver enforce a
+    /// per-transfer timeout natively.
+    ///
+    /// `no_data_timeout` bounds how long the transfer may wait without any
+    /// data being transferred at all; `completion_timeout` bounds the total
+    /// time allowed for the transfer to complete. Either timeout firing ends
+    /// the transfer with [`TransferError::Cancelled`][crate::transfer::TransferError::Cancelled],
+    /// but — unlike cancelling via [`Endpoint::cancel_all`] — the resulting
+    /// [`Completion::actual_len`][crate::transfer::Completion::actual_len] correctly
+    /// reflects however many bytes were transferred before the timeout, since
+    /// the timeout is handled by the USB driver itself rather than by an
+    /// asynchronous software-side abort.
+    ///
+    /// **macOS only.** This uses IOKit's `ReadPipeAsyncTO`/`WritePipeAsyncTO`,
+    /// which is not available through the cross-platform `submit` API. On
+    /// other platforms, software-side cancellation (`cancel_all`) does not
+    /// reliably preserve `actual_len`, so there is no equivalent yet.
+    #[cfg(target_os = "macos")]
+    pub fn submit_with_timeout(
+        &mut self,
+        buf: Buffer,
+        no_data_timeout: std::time::Duration,
+        completion_timeout: std::time::Duration,
+    ) {
+        if Dir::DIR == Direction::In {
+            let req_len = buf.requested_len();
+            if req_len == 0 || req_len % self.max_packet_size() != 0 {
+                warn!(
+                    "Submitting transfer with length {req_len} which is not a multiple of max packet size {} on IN endpoint {:02x}",
+                    self.max_packet_size(),
+                    self.endpoint_address(),
+                );
+
+                return self.backend.submit_err(buf, TransferError::InvalidArgument);
+            }
+        }
+
+        self.backend.submit_with_timeout(
+            buf,
+            no_data_timeout.as_millis().min(u32::MAX as u128) as u32,
+            completion_timeout.as_millis().min(u32::MAX as u128) as u32,
+        )
+    }
+
     /// Return a `Future` that waits for the next pending transfer to complete.
     ///
     /// This future is cancel-safe: it can be cancelled and re-created without

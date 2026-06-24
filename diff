@@ -1,0 +1,137 @@
+diff --color=auto -c -r src/device.rs ../usb-sniffer/software-rs/vendor/nusb/src/device.rs
+*** src/device.rs	Wed Jun 24 18:04:30 2026
+--- ../usb-sniffer/software-rs/vendor/nusb/src/device.rs	Tue Jun 23 15:19:27 2026
+***************
+*** 763,768 ****
+--- 763,812 ----
+          self.backend.submit(buf)
+      }
+  
++     /// Like [`submit`][`Self::submit`], but lets the OS driver enforce a
++     /// per-transfer timeout natively.
++     ///
++     /// `no_data_timeout` bounds how long the transfer may wait without any
++     /// data being transferred at all; `completion_timeout` bounds the total
++     /// time allowed for the transfer to complete. Either timeout firing ends
++     /// the transfer with [`TransferError::Cancelled`][crate::transfer::TransferError::Cancelled],
++     /// but — unlike cancelling via [`Endpoint::cancel_all`] — the resulting
++     /// [`Completion::actual_len`][crate::transfer::Completion::actual_len] correctly
++     /// reflects however many bytes were transferred before the timeout, since
++     /// the timeout is handled by the USB driver itself rather than by an
++     /// asynchronous software-side abort.
++     ///
++     /// **macOS only.** This uses IOKit's `ReadPipeAsyncTO`/`WritePipeAsyncTO`,
++     /// which is not available through the cross-platform `submit` API. On
++     /// other platforms, software-side cancellation (`cancel_all`) does not
++     /// reliably preserve `actual_len`, so there is no equivalent yet.
++     #[cfg(target_os = "macos")]
++     pub fn submit_with_timeout(
++         &mut self,
++         buf: Buffer,
++         no_data_timeout: std::time::Duration,
++         completion_timeout: std::time::Duration,
++     ) {
++         if Dir::DIR == Direction::In {
++             let req_len = buf.requested_len();
++             if req_len == 0 || req_len % self.max_packet_size() != 0 {
++                 warn!(
++                     "Submitting transfer with length {req_len} which is not a multiple of max packet size {} on IN endpoint {:02x}",
++                     self.max_packet_size(),
++                     self.endpoint_address(),
++                 );
++ 
++                 return self.backend.submit_err(buf, TransferError::InvalidArgument);
++             }
++         }
++ 
++         self.backend.submit_with_timeout(
++             buf,
++             no_data_timeout.as_millis().min(u32::MAX as u128) as u32,
++             completion_timeout.as_millis().min(u32::MAX as u128) as u32,
++         )
++     }
++ 
+      /// Return a `Future` that waits for the next pending transfer to complete.
+      ///
+      /// This future is cancel-safe: it can be cancelled and re-created without
+diff --color=auto -c -r src/platform/macos_iokit/device.rs ../usb-sniffer/software-rs/vendor/nusb/src/platform/macos_iokit/device.rs
+*** src/platform/macos_iokit/device.rs	Wed Jun 24 18:04:30 2026
+--- ../usb-sniffer/software-rs/vendor/nusb/src/platform/macos_iokit/device.rs	Tue Jun 23 15:19:06 2026
+***************
+*** 598,603 ****
+--- 598,672 ----
+          self.pending.push_back(transfer);
+      }
+  
++     /// `submit` のタイムアウト付き版。IOKit の `ReadPipeAsyncTO`/`WritePipeAsyncTO`
++     /// を使い、ドライバ自身に転送のタイムアウトを管理させる。
++     ///
++     /// `submit` + ソフトウェア側の `AbortPipe` によるキャンセルとの違いは、
++     /// タイムアウトが発生した際に `actual_len` がそれまでに実際に転送された
++     /// バイト数を正しく反映する点 (AbortPipe によるキャンセルでは macOS の
++     /// IOKit USB ドライバが常に `actual_len = 0` を返すため、部分データが
++     /// 失われる)。`no_data_timeout`/`completion_timeout` はそれぞれ IOKit の
++     /// 同名パラメータに対応する (詳細は Apple の IOUSBLib ドキュメント、
++     /// または `control_blocking` の `IOUSBDevRequestTO` を参照)。
++     pub(crate) fn submit_with_timeout(
++         &mut self,
++         buffer: Buffer,
++         no_data_timeout_ms: u32,
++         completion_timeout_ms: u32,
++     ) {
++         let transfer = self.make_transfer(buffer);
++         let endpoint = self.inner.address;
++         let dir = Direction::from_address(endpoint);
++         let req_len = transfer.requested_len;
++         let buf_ptr = transfer.buf;
++ 
++         let transfer = transfer.pre_submit();
++         let ptr = transfer.as_ptr();
++ 
++         let res = unsafe {
++             match dir {
++                 Direction::Out => call_iokit_function!(
++                     self.inner.interface.interface.raw,
++                     WritePipeAsyncTO(
++                         self.inner.pipe_ref,
++                         buf_ptr as *mut c_void,
++                         req_len,
++                         no_data_timeout_ms,
++                         completion_timeout_ms,
++                         Some(transfer_callback),
++                         ptr as *mut c_void
++                     )
++                 ),
++                 Direction::In => call_iokit_function!(
++                     self.inner.interface.interface.raw,
++                     ReadPipeAsyncTO(
++                         self.inner.pipe_ref,
++                         buf_ptr as *mut c_void,
++                         req_len,
++                         no_data_timeout_ms,
++                         completion_timeout_ms,
++                         Some(transfer_callback),
++                         ptr as *mut c_void
++                     )
++                 ),
++             }
++         };
++ 
++         if res == kIOReturnSuccess {
++             debug!(
++                 "Submitted {dir:?} transfer {ptr:?} of len {req_len} on endpoint {endpoint:02X} (TO)"
++             );
++         } else {
++             error!("Failed to submit {dir:?} transfer {ptr:?} of len {req_len} on endpoint {endpoint:02X} (TO): {res:x}");
++             unsafe {
++                 (*ptr).status = res;
++                 notify_completion::<super::TransferData>(ptr);
++             }
++         }
++ 
++         self.pending.push_back(transfer);
++     }
++ 
+      pub(crate) fn submit_err(&mut self, buffer: Buffer, err: TransferError) {
+          assert_eq!(err, TransferError::InvalidArgument);
+          let mut transfer = self.make_transfer(buffer);
